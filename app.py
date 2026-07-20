@@ -1,7 +1,11 @@
+import json
+import os
+from typing import List
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel
-from typing import List
 
 app = FastAPI()
 
@@ -11,6 +15,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+client = OpenAI(
+    api_key=os.getenv("AIPIPE_API_KEY"),
+    base_url="https://aipipe.org/openai/v1",
 )
 
 
@@ -31,70 +40,103 @@ def home():
 
 @app.post("/")
 def grounded_qa(request: QARequest):
-    try:
-        if not request.question.strip() or len(request.chunks) == 0:
-            return {
-                "answer": "I don't know",
-                "citations": [],
-                "confidence": 0.0,
-                "answerable": False
-            }
-
-        stopwords = {
-            "what", "when", "where", "who", "which", "why", "how",
-            "is", "are", "was", "were", "be", "been", "being",
-            "the", "a", "an", "of", "to", "in", "on", "for",
-            "and", "or", "did", "does", "do", "at", "by",
-            "with", "from", "into", "about", "than", "then",
-            "this", "that", "these", "those", "it", "its",
-            "year"
-        }
-
-        keywords = []
-
-        for word in request.question.lower().split():
-            word = word.strip(".,?!:;()[]{}\"'")
-            if word and word not in stopwords:
-                keywords.append(word)
-
-        best_chunk = None
-        best_score = 0
-
-        for chunk in request.chunks:
-            text = chunk.text.lower()
-            score = 0
-
-            for word in keywords:
-                if word in text:
-                    score += 1
-
-            if score > best_score:
-                best_score = score
-                best_chunk = chunk
-
-        if best_chunk is None or best_score == 0:
-            return {
-                "answer": "I don't know",
-                "citations": [],
-                "confidence": 0.2,
-                "answerable": False
-            }
-
-        confidence = 0.5 + 0.1 * best_score
-        if confidence > 0.95:
-            confidence = 0.95
-
+    if not request.question.strip() or not request.chunks:
         return {
-            "answer": best_chunk.text,
-            "citations": [best_chunk.chunk_id],
-            "confidence": round(confidence, 2),
-            "answerable": True
+            "answer": "I don't know.",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False,
         }
+
+    context = "\n\n".join(
+        f"Chunk ID: {chunk.chunk_id}\n{chunk.text}"
+        for chunk in request.chunks
+    )
+
+    prompt = f"""
+You are a grounded question answering system.
+
+Answer ONLY using the information contained in the chunks below.
+
+Rules:
+1. Never use outside knowledge.
+2. If the answer is not completely supported by the chunks, answer "I don't know."
+3. Cite ONLY chunk IDs that directly support the answer.
+4. Do NOT cite irrelevant chunks.
+5. If multiple chunks support the answer, include all of them.
+6. Return ONLY valid JSON.
+
+Question:
+{request.question}
+
+Chunks:
+{context}
+
+Return exactly this JSON:
+
+{{
+  "answer":"...",
+  "citations":["chunk_id"],
+  "confidence":0.0,
+  "answerable":true
+}}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a grounded QA assistant. Respond only with valid JSON.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0,
+        )
+
+        output = response.choices[0].message.content.strip()
+
+        # Remove markdown fences if present
+        if output.startswith("```"):
+            lines = output.splitlines()
+            lines = [line for line in lines if not line.startswith("```")]
+            output = "\n".join(lines)
+
+        result = json.loads(output)
+
+        if "answer" not in result:
+            raise ValueError
+
+        if "citations" not in result:
+            result["citations"] = []
+
+        if "confidence" not in result:
+            result["confidence"] = 0.0
+
+        if "answerable" not in result:
+            result["answerable"] = False
+
+        valid_ids = {chunk.chunk_id for chunk in request.chunks}
+
+        result["citations"] = [
+            cid for cid in result["citations"] if cid in valid_ids
+        ]
+
+        result["confidence"] = max(
+            0.0,
+            min(1.0, float(result["confidence"]))
+        )
+
+        return result
 
     except Exception:
         return {
-            "answer": "I don't know",
+            "answer": "I don't know.",
             "citations": [],
             "confidence": 0.0,
-            "answerable": False
+            "answerable": False,
         }
