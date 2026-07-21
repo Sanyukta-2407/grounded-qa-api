@@ -1,11 +1,13 @@
-import json
 import os
-from typing import List
+import json
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
 from pydantic import BaseModel
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -17,21 +19,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-NOT_ANSWERABLE = "I don't know"
-
-_client = None
-
-
-def get_client():
-    """Lazily construct the OpenAI client so a missing API key doesn't
-    crash the whole app at import/startup time."""
-    global _client
-    if _client is None:
-        api_key = os.getenv("AIPIPE_API_KEY")
-        if not api_key:
-            raise RuntimeError("AIPIPE_API_KEY environment variable is not set")
-        _client = OpenAI(api_key=api_key, base_url="https://aipipe.org/openai/v1")
-    return _client
+client = OpenAI(
+    api_key=os.getenv("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openai/v1",
+)
 
 
 class Chunk(BaseModel):
@@ -41,111 +32,95 @@ class Chunk(BaseModel):
 
 class QARequest(BaseModel):
     question: str
-    chunks: List[Chunk] = []
-
-
-def not_answerable_response(confidence: float = 0.0):
-    return {
-        "answer": NOT_ANSWERABLE,
-        "citations": [],
-        "confidence": max(0.0, min(confidence, 0.3)),
-        "answerable": False,
-    }
-
-
-@app.get("/")
-def home():
-    return {"status": "Grounded QA API is running"}
+    chunks: list[Chunk]
 
 
 @app.post("/")
 def grounded_qa(request: QARequest):
-    # Guard: empty/malformed input
-    if not request.question or not request.question.strip() or not request.chunks:
-        return not_answerable_response()
+    if not request.question.strip():
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False,
+        }
 
-    context = "\n\n".join(
-        f"Chunk ID: {chunk.chunk_id}\n{chunk.text}"
-        for chunk in request.chunks
-    )
+    if len(request.chunks) == 0:
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False,
+        }
+
+    context = ""
+
+    for chunk in request.chunks:
+        context += f"{chunk.chunk_id}: {chunk.text}\n"
 
     prompt = f"""
 You are a grounded question answering system.
 
-Answer ONLY using the information contained in the chunks below.
+Answer ONLY using the supplied context.
 
-Rules:
-1. Never use outside knowledge.
-2. If the answer is not completely supported by the chunks, set "answerable" to false,
-   set "answer" to "I don't know", and set "citations" to an empty list.
-3. Cite ONLY chunk IDs that directly support the answer.
-4. Do NOT cite irrelevant chunks.
-5. If multiple chunks support the answer, include all of them.
-6. Return ONLY valid JSON, with no markdown fences and no extra text.
+If the answer is not explicitly supported by the context, return:
+
+{{
+"answer":"I don't know",
+"citations":[],
+"confidence":0.2,
+"answerable":false
+}}
+
+If answerable, return ONLY valid JSON:
+
+{{
+"answer":"...",
+"citations":["C1"],
+"confidence":0.95,
+"answerable":true
+}}
+
+Use only provided chunk IDs.
+
+Context:
+{context}
 
 Question:
 {request.question}
-
-Chunks:
-{context}
-
-Return exactly this JSON shape:
-
-{{
-  "answer": "...",
-  "citations": ["chunk_id"],
-  "confidence": 0.0,
-  "answerable": true
-}}
 """
 
     try:
-        response = get_client().chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4.1-mini",
+            temperature=0,
+            response_format={"type": "json_object"},
             messages=[
                 {
-                    "role": "system",
-                    "content": "You are a grounded QA assistant. Respond only with valid JSON.",
-                },
-                {"role": "user", "content": prompt},
+                    "role": "user",
+                    "content": prompt,
+                }
             ],
-            temperature=0,
-            timeout=10,
         )
 
-        output = response.choices[0].message.content.strip()
+        result = json.loads(response.choices[0].message.content)
 
-        # Strip markdown fences if the model added them anyway
-        if output.startswith("```"):
-            lines = output.splitlines()
-            lines = [line for line in lines if not line.startswith("```")]
-            output = "\n".join(lines)
+        valid_ids = {c.chunk_id for c in request.chunks}
 
-        result = json.loads(output)
-
-        answer = str(result.get("answer", "")).strip()
-        confidence = result.get("confidence", 0.0)
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        confidence = max(0.0, min(confidence, 1.0))
-
-        valid_ids = {chunk.chunk_id for chunk in request.chunks}
-        citations = [
-            cid for cid in result.get("citations", []) if cid in valid_ids
+        result["citations"] = [
+            cid for cid in result.get("citations", [])
+            if cid in valid_ids
         ]
 
-        # Strict unanswerable rule: no citations or model says it doesn't know
-        if not answer or answer.strip().lower() == NOT_ANSWERABLE.lower() or not citations:
-            return not_answerable_response(confidence)
+        if not result.get("answerable", False):
+            result["answer"] = "I don't know"
+            result["citations"] = []
+            result["confidence"] = min(
+                float(result.get("confidence", 0.2)),
+                0.3,
+            )
 
-        return {
-            "answer": answer,
-            "citations": citations,
-            "confidence": confidence,
-            "answerable": True,
-        }
+        return result
 
-    except Exception:
-        return not_answerable_response()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
